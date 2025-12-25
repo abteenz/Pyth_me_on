@@ -1971,7 +1971,7 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                     if files_pushed > 0:
                         status = "pr_created"
                         messages.append(f"✅ **Success:** Pushed {files_pushed} files to branch `{target_branch}`")
-                        
+
                         # Add system lock
                         messages.append("🔒 Adding System Lock...")
                         if pan_client.add_system_lock():
@@ -1988,24 +1988,6 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                         messages.append(f"**Failed files:**")
                         for failed_file in failed_files_list:
                             messages.append(f"   - {failed_file}")
-                    
-                    if files_pushed > 0:
-                        status = "pr_created"
-                        messages.append(f"✅ **Success:** Pushed {files_pushed} files to branch `{target_branch}`")
-                        
-                        # Add system lock
-                        messages.append("🔒 Adding System Lock...")
-                        if pan_client.add_system_lock():
-                            messages.append("✅ System Lock Added.")
-                        else:
-                            messages.append("⚠️ Failed to add System Lock.")
-                            errors.append("Failed to add system lock")
-                    else:
-                        status = "github_push_failed"
-                        messages.append("❌ All file pushes failed.")
-                    
-                    if files_failed > 0:
-                        messages.append(f"⚠️ **Warning:** {files_failed} files failed to push")
     
     # Return results
     return CommandResults(
