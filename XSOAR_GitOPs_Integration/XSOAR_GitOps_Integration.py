@@ -389,15 +389,23 @@ class PanOsClient:
         return False, "Validation Job timed out (did not finish in 300s)."
 
     def add_system_lock(self):
-        # (Same as before)
+        """
+        Add commit lock with automation comment.
+        Note: execute_api_call() returns None on error, so if we get a root element, it was successful.
+        """
         comment = "AUTOMATION: Waiting for PR Approval. Do not remove."
         cmd = {'type': 'op', 'cmd': f'<request><commit-lock><add><comment>{comment}</comment></add></commit-lock></request>'}
         root = self.execute_api_call(cmd)
+
         if root is not None:
+            # Success! (execute_api_call returns None on API errors)
+            # Log the response for debugging
             xml_str = ET.tostring(root, encoding='unicode')
-            if 'success' in xml_str.lower() or 'added' in xml_str.lower():
-                return True
-        return False
+            demisto.debug(f"Add lock response: {xml_str[:200]}")
+            return True
+        else:
+            demisto.error("Failed to add commit lock - API call returned None")
+            return False
 
 class GitHubClient:
     """
@@ -892,26 +900,23 @@ def extract_section_from_config(full_config_str, section_type, section_name):
             return None
         
         if section_type == 'shared':
-            # Extract everything EXCEPT device-group, template, template-stack
-            shared_elem = localhost.find('shared')
+            # IMPORTANT: Shared is at ROOT level, not inside localhost.localdomain!
+            # Structure: <config><devices>...</devices><shared>...</shared></config>
+            shared_elem = root.find('shared')
             if shared_elem is not None:
-                # Create wrapper
+                # Create wrapper (shared stays at root level, just like in original config)
                 config_root = ET.Element('config')
                 config_root.set('version', root.get('version', ''))
                 config_root.set('urldb', root.get('urldb', ''))
 
-                devices = ET.SubElement(config_root, 'devices')
-                entry = ET.SubElement(devices, 'entry')
-                entry.set('name', 'localhost.localdomain')
-
                 # IMPORTANT: Use deepcopy to avoid modifying original tree
                 shared_copy = deepcopy(shared_elem)
-                entry.append(shared_copy)
+                config_root.append(shared_copy)
 
                 return ET.tostring(config_root, encoding='unicode')
             else:
-                demisto.error("Could not find shared element in config")
-                demisto.debug(f"localhost.localdomain children: {[child.tag for child in localhost]}")
+                demisto.error("Could not find shared element at root level")
+                demisto.debug(f"Config root children: {[child.tag for child in root]}")
                 return None
         
         else:
