@@ -5,6 +5,7 @@ Firewall GitOps Sync Integration
 import base64
 import re
 import xml.etree.ElementTree as ET
+from copy import deepcopy
 import requests
 import urllib3
 import time
@@ -584,16 +585,17 @@ class GitHubClient:
             demisto.error(f"❌ Git Data API Push failed for {file_path}: {str(e)}")
             return False
 
-    def push_multiple_files(self, files, message, branch):
+    def push_multiple_files(self, files, message, branch, chunk_size=15):
         """
-        Push multiple files in a SINGLE commit using Git Data API.
-        Much more efficient for initial sync (creates 1 commit instead of 50+).
+        Push multiple files using Git Data API with chunking to avoid payload limits.
+        Creates multiple commits if needed (one per chunk).
 
         Args:
             files: List of dicts with 'path' and 'content' keys
                    Example: [{'path': 'device-groups/prod.xml', 'content': '<xml>...</xml>'}, ...]
-            message: Commit message
+            message: Base commit message (chunk number appended if multiple chunks)
             branch: Target branch name
+            chunk_size: Number of files per commit (default: 15 to avoid GitHub limits)
 
         Returns:
             bool: True if successful, False otherwise
@@ -603,90 +605,117 @@ class GitHubClient:
                 demisto.debug("No files to push")
                 return True
 
-            demisto.debug(f"Pushing {len(files)} files in a single commit...")
+            total_files = len(files)
 
-            # 1. Get the latest commit SHA of the branch
-            branch_sha = self.get_branch_sha(branch)
-            if not branch_sha:
-                demisto.error(f"Could not find branch {branch}")
-                return False
+            # Split files into chunks to avoid GitHub API payload limits
+            chunks = [files[i:i + chunk_size] for i in range(0, total_files, chunk_size)]
+            num_chunks = len(chunks)
 
-            # 2. Get the tree SHA of the latest commit
-            commit_url = f"{self.repo_root_url}/git/commits/{branch_sha}"
-            res = requests.get(commit_url, headers=self.headers)
-            res.raise_for_status()
-            tree_sha = res.json()['tree']['sha']
+            if num_chunks > 1:
+                demisto.debug(f"Pushing {total_files} files in {num_chunks} chunks of up to {chunk_size} files each...")
+            else:
+                demisto.debug(f"Pushing {total_files} files in a single commit...")
 
-            # 3. Create Blobs for ALL files
-            tree_items = []
-            for idx, file_info in enumerate(files):
-                file_path = file_info['path']
-                content = file_info['content']
+            # Process each chunk
+            for chunk_idx, chunk in enumerate(chunks, 1):
+                chunk_msg = f"{message} (chunk {chunk_idx}/{num_chunks})" if num_chunks > 1 else message
 
-                demisto.debug(f"Creating blob {idx+1}/{len(files)}: {file_path} ({len(content)} chars)")
+                demisto.debug(f"Processing chunk {chunk_idx}/{num_chunks} with {len(chunk)} files...")
 
-                # Use base64 encoding for large file support
-                blob_url = f"{self.repo_root_url}/git/blobs"
-                content_bytes = content.encode('utf-8')
-                content_b64 = base64.b64encode(content_bytes).decode('ascii')
+                # 1. Get the latest commit SHA of the branch (refreshed for each chunk)
+                branch_sha = self.get_branch_sha(branch)
+                if not branch_sha:
+                    demisto.error(f"Could not find branch {branch}")
+                    return False
 
-                blob_data = {
-                    "content": content_b64,
-                    "encoding": "base64"
-                }
-                res = requests.post(blob_url, headers=self.headers, json=blob_data)
+                # 2. Get the tree SHA of the latest commit
+                commit_url = f"{self.repo_root_url}/git/commits/{branch_sha}"
+                res = requests.get(commit_url, headers=self.headers)
                 res.raise_for_status()
-                blob_sha = res.json()['sha']
+                tree_sha = res.json()['tree']['sha']
 
-                # Add to tree items
-                tree_items.append({
-                    "path": file_path,
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": blob_sha
-                })
+                # 3. Create Blobs for files in this chunk
+                tree_items = []
+                for idx, file_info in enumerate(chunk):
+                    file_path = file_info['path']
+                    content = file_info['content']
 
-            # 4. Create a new Tree with ALL blobs
-            demisto.debug(f"Creating tree with {len(tree_items)} items...")
-            tree_url = f"{self.repo_root_url}/git/trees"
-            tree_data = {
-                "base_tree": tree_sha,
-                "tree": tree_items
-            }
-            res = requests.post(tree_url, headers=self.headers, json=tree_data)
-            res.raise_for_status()
-            new_tree_sha = res.json()['sha']
+                    demisto.debug(f"Creating blob {idx+1}/{len(chunk)}: {file_path} ({len(content)} chars)")
 
-            # 5. Create a single Commit
-            demisto.debug("Creating commit...")
-            new_commit_url = f"{self.repo_root_url}/git/commits"
-            commit_data = {
-                "message": message,
-                "tree": new_tree_sha,
-                "parents": [branch_sha]
-            }
-            res = requests.post(new_commit_url, headers=self.headers, json=commit_data)
-            res.raise_for_status()
-            new_commit_sha = res.json()['sha']
+                    # Use base64 encoding for large file support
+                    blob_url = f"{self.repo_root_url}/git/blobs"
+                    content_bytes = content.encode('utf-8')
+                    content_b64 = base64.b64encode(content_bytes).decode('ascii')
 
-            # 6. Update the Branch Reference
-            demisto.debug("Updating branch reference...")
-            ref_url = f"{self.repo_root_url}/git/refs/heads/{branch}"
-            ref_data = {
-                "sha": new_commit_sha,
-                "force": False
-            }
-            res = requests.patch(ref_url, headers=self.headers, json=ref_data)
+                    blob_data = {
+                        "content": content_b64,
+                        "encoding": "base64"
+                    }
+                    res = requests.post(blob_url, headers=self.headers, json=blob_data)
+                    res.raise_for_status()
+                    blob_sha = res.json()['sha']
 
-            if res.status_code != 200:
-                demisto.error(f"❌ Failed to update branch ref: {res.status_code} {res.text}")
-                return False
+                    # Add to tree items
+                    tree_items.append({
+                        "path": file_path,
+                        "mode": "100644",
+                        "type": "blob",
+                        "sha": blob_sha
+                    })
 
-            demisto.debug(f"✅ Successfully pushed {len(files)} files in single commit")
+                # 4. Create a new Tree with blobs from this chunk
+                demisto.debug(f"Creating tree with {len(tree_items)} items...")
+                tree_url = f"{self.repo_root_url}/git/trees"
+                tree_data = {
+                    "base_tree": tree_sha,
+                    "tree": tree_items
+                }
+                res = requests.post(tree_url, headers=self.headers, json=tree_data)
+                res.raise_for_status()
+                new_tree_sha = res.json()['sha']
+
+                # 5. Create a Commit for this chunk
+                demisto.debug(f"Creating commit for chunk {chunk_idx}...")
+                new_commit_url = f"{self.repo_root_url}/git/commits"
+                commit_data = {
+                    "message": chunk_msg,
+                    "tree": new_tree_sha,
+                    "parents": [branch_sha]
+                }
+                res = requests.post(new_commit_url, headers=self.headers, json=commit_data)
+                res.raise_for_status()
+                new_commit_sha = res.json()['sha']
+
+                # 6. Update the Branch Reference
+                demisto.debug(f"Updating branch reference for chunk {chunk_idx}...")
+                ref_url = f"{self.repo_root_url}/git/refs/heads/{branch}"
+                ref_data = {
+                    "sha": new_commit_sha,
+                    "force": False
+                }
+                res = requests.patch(ref_url, headers=self.headers, json=ref_data)
+
+                if res.status_code != 200:
+                    demisto.error(f"❌ Failed to update branch ref: {res.status_code} {res.text}")
+                    return False
+
+                demisto.debug(f"✅ Chunk {chunk_idx}/{num_chunks} pushed successfully")
+
+            demisto.debug(f"✅ Successfully pushed all {total_files} files in {num_chunks} commit(s)")
             return True
 
+        except requests.exceptions.HTTPError as e:
+            # Detailed HTTP error logging
+            demisto.error(f"❌ Batch push HTTP error: {str(e)}")
+            if hasattr(e.response, 'status_code'):
+                demisto.error(f"Status code: {e.response.status_code}")
+            if hasattr(e.response, 'text'):
+                demisto.error(f"Response: {e.response.text[:500]}")  # First 500 chars
+            return False
         except Exception as e:
             demisto.error(f"❌ Batch push failed: {str(e)}")
+            import traceback
+            demisto.error(f"Traceback: {traceback.format_exc()}")
             return False
 
 
@@ -870,17 +899,19 @@ def extract_section_from_config(full_config_str, section_type, section_name):
                 config_root = ET.Element('config')
                 config_root.set('version', root.get('version', ''))
                 config_root.set('urldb', root.get('urldb', ''))
-                
+
                 devices = ET.SubElement(config_root, 'devices')
                 entry = ET.SubElement(devices, 'entry')
                 entry.set('name', 'localhost.localdomain')
-                
-                # Copy shared element
-                entry.append(shared_elem)
-                
+
+                # IMPORTANT: Use deepcopy to avoid modifying original tree
+                shared_copy = deepcopy(shared_elem)
+                entry.append(shared_copy)
+
                 return ET.tostring(config_root, encoding='unicode')
             else:
-                demisto.error("Could not find shared element")
+                demisto.error("Could not find shared element in config")
+                demisto.debug(f"localhost.localdomain children: {[child.tag for child in localhost]}")
                 return None
         
         else:
@@ -916,15 +947,17 @@ def extract_section_from_config(full_config_str, section_type, section_name):
             config_root = ET.Element('config')
             config_root.set('version', root.get('version', ''))
             config_root.set('urldb', root.get('urldb', ''))
-            
+
             devices = ET.SubElement(config_root, 'devices')
             entry = ET.SubElement(devices, 'entry')
             entry.set('name', 'localhost.localdomain')
-            
+
             # Create parent container and add the section
+            # IMPORTANT: Use deepcopy to avoid modifying original tree
             section_container = ET.SubElement(entry, parent_xpath)
-            section_container.append(section_entry)
-            
+            section_entry_copy = deepcopy(section_entry)
+            section_container.append(section_entry_copy)
+
             return ET.tostring(config_root, encoding='unicode')
             
     except Exception as e:
