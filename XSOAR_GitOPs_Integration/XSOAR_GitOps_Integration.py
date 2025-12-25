@@ -508,6 +508,7 @@ class GitHubClient:
     def push_file(self, file_path, content, message, branch):
         """
         Push file using Git Data API (Tree/Commit) to support large files.
+        Uses base64 encoding to handle files of any size (including 20MB+ Panorama configs).
         """
         try:
             # 1. Get the latest commit SHA of the branch
@@ -523,10 +524,14 @@ class GitHubClient:
             tree_sha = res.json()['tree']['sha']
 
             # 3. Create a Blob for the new content
+            # IMPORTANT: Use base64 encoding for large files (Panorama configs can be 20MB+)
             blob_url = f"{self.repo_root_url}/git/blobs"
+            content_bytes = content.encode('utf-8')
+            content_b64 = base64.b64encode(content_bytes).decode('ascii')
+
             blob_data = {
-                "content": content,
-                "encoding": "utf-8"
+                "content": content_b64,
+                "encoding": "base64"
             }
             res = requests.post(blob_url, headers=self.headers, json=blob_data)
             res.raise_for_status()
@@ -577,6 +582,111 @@ class GitHubClient:
 
         except Exception as e:
             demisto.error(f"❌ Git Data API Push failed for {file_path}: {str(e)}")
+            return False
+
+    def push_multiple_files(self, files, message, branch):
+        """
+        Push multiple files in a SINGLE commit using Git Data API.
+        Much more efficient for initial sync (creates 1 commit instead of 50+).
+
+        Args:
+            files: List of dicts with 'path' and 'content' keys
+                   Example: [{'path': 'device-groups/prod.xml', 'content': '<xml>...</xml>'}, ...]
+            message: Commit message
+            branch: Target branch name
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if not files:
+                demisto.debug("No files to push")
+                return True
+
+            demisto.debug(f"Pushing {len(files)} files in a single commit...")
+
+            # 1. Get the latest commit SHA of the branch
+            branch_sha = self.get_branch_sha(branch)
+            if not branch_sha:
+                demisto.error(f"Could not find branch {branch}")
+                return False
+
+            # 2. Get the tree SHA of the latest commit
+            commit_url = f"{self.repo_root_url}/git/commits/{branch_sha}"
+            res = requests.get(commit_url, headers=self.headers)
+            res.raise_for_status()
+            tree_sha = res.json()['tree']['sha']
+
+            # 3. Create Blobs for ALL files
+            tree_items = []
+            for idx, file_info in enumerate(files):
+                file_path = file_info['path']
+                content = file_info['content']
+
+                demisto.debug(f"Creating blob {idx+1}/{len(files)}: {file_path} ({len(content)} chars)")
+
+                # Use base64 encoding for large file support
+                blob_url = f"{self.repo_root_url}/git/blobs"
+                content_bytes = content.encode('utf-8')
+                content_b64 = base64.b64encode(content_bytes).decode('ascii')
+
+                blob_data = {
+                    "content": content_b64,
+                    "encoding": "base64"
+                }
+                res = requests.post(blob_url, headers=self.headers, json=blob_data)
+                res.raise_for_status()
+                blob_sha = res.json()['sha']
+
+                # Add to tree items
+                tree_items.append({
+                    "path": file_path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob_sha
+                })
+
+            # 4. Create a new Tree with ALL blobs
+            demisto.debug(f"Creating tree with {len(tree_items)} items...")
+            tree_url = f"{self.repo_root_url}/git/trees"
+            tree_data = {
+                "base_tree": tree_sha,
+                "tree": tree_items
+            }
+            res = requests.post(tree_url, headers=self.headers, json=tree_data)
+            res.raise_for_status()
+            new_tree_sha = res.json()['sha']
+
+            # 5. Create a single Commit
+            demisto.debug("Creating commit...")
+            new_commit_url = f"{self.repo_root_url}/git/commits"
+            commit_data = {
+                "message": message,
+                "tree": new_tree_sha,
+                "parents": [branch_sha]
+            }
+            res = requests.post(new_commit_url, headers=self.headers, json=commit_data)
+            res.raise_for_status()
+            new_commit_sha = res.json()['sha']
+
+            # 6. Update the Branch Reference
+            demisto.debug("Updating branch reference...")
+            ref_url = f"{self.repo_root_url}/git/refs/heads/{branch}"
+            ref_data = {
+                "sha": new_commit_sha,
+                "force": False
+            }
+            res = requests.patch(ref_url, headers=self.headers, json=ref_data)
+
+            if res.status_code != 200:
+                demisto.error(f"❌ Failed to update branch ref: {res.status_code} {res.text}")
+                return False
+
+            demisto.debug(f"✅ Successfully pushed {len(files)} files in single commit")
+            return True
+
+        except Exception as e:
+            demisto.error(f"❌ Batch push failed: {str(e)}")
             return False
 
 
@@ -1438,76 +1548,68 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                     }
                 )
             
-            files_pushed = 0
+            # Prepare all files for batch upload (more efficient than individual commits)
+            files_to_push = []
             files_failed = 0
-            
-            # Push device-groups
-            demisto.debug(f"Pushing {len(all_sections['device-groups'])} device-groups...")
+
+            # Extract device-groups
+            demisto.debug(f"Extracting {len(all_sections['device-groups'])} device-groups...")
             for dg_name in all_sections['device-groups']:
                 dg_xml = extract_section_from_config(full_config_str, 'device-group', dg_name)
                 if dg_xml:
                     file_path = f"{base_path}/device-groups/{dg_name}.xml" if base_path else f"device-groups/{dg_name}.xml"
-                    if gh_client.push_file(file_path, dg_xml, f"Initial sync: {dg_name}", "main"):
-                        files_pushed += 1
-                    else:
-                        files_failed += 1
-                        errors.append(f"Failed to push device-group: {dg_name}")
+                    files_to_push.append({'path': file_path, 'content': dg_xml})
                 else:
                     files_failed += 1
                     errors.append(f"Failed to extract device-group: {dg_name}")
                     demisto.error(f"Failed to extract device-group: {dg_name}")
-            
-            # Push templates
-            demisto.debug(f"Pushing {len(all_sections['templates'])} templates...")
+
+            # Extract templates
+            demisto.debug(f"Extracting {len(all_sections['templates'])} templates...")
             for tmpl_name in all_sections['templates']:
                 tmpl_xml = extract_section_from_config(full_config_str, 'template', tmpl_name)
                 if tmpl_xml:
                     file_path = f"{base_path}/templates/{tmpl_name}.xml" if base_path else f"templates/{tmpl_name}.xml"
-                    if gh_client.push_file(file_path, tmpl_xml, f"Initial sync: {tmpl_name}", "main"):
-                        files_pushed += 1
-                    else:
-                        files_failed += 1
-                        errors.append(f"Failed to push template: {tmpl_name}")
+                    files_to_push.append({'path': file_path, 'content': tmpl_xml})
                 else:
                     files_failed += 1
                     errors.append(f"Failed to extract template: {tmpl_name}")
                     demisto.error(f"Failed to extract template: {tmpl_name}")
-            
-            # Push template-stacks
-            demisto.debug(f"Pushing {len(all_sections['template-stacks'])} template-stacks...")
+
+            # Extract template-stacks
+            demisto.debug(f"Extracting {len(all_sections['template-stacks'])} template-stacks...")
             for ts_name in all_sections['template-stacks']:
                 ts_xml = extract_section_from_config(full_config_str, 'template-stack', ts_name)
                 if ts_xml:
                     file_path = f"{base_path}/template-stacks/{ts_name}.xml" if base_path else f"template-stacks/{ts_name}.xml"
-                    if gh_client.push_file(file_path, ts_xml, f"Initial sync: {ts_name}", "main"):
-                        files_pushed += 1
-                    else:
-                        files_failed += 1
-                        errors.append(f"Failed to push template-stack: {ts_name}")
+                    files_to_push.append({'path': file_path, 'content': ts_xml})
                 else:
                     files_failed += 1
                     errors.append(f"Failed to extract template-stack: {ts_name}")
                     demisto.error(f"Failed to extract template-stack: {ts_name}")
-            
-            # Push shared objects
-            demisto.debug("Extracting and pushing shared objects...")
+
+            # Extract shared objects
+            demisto.debug("Extracting shared objects...")
             shared_xml = extract_section_from_config(full_config_str, 'shared', None)
             if shared_xml:
                 demisto.debug(f"Shared objects extracted: {len(shared_xml)} characters")
                 file_path = f"{base_path}/shared/shared.xml" if base_path else "shared/shared.xml"
-                if gh_client.push_file(file_path, shared_xml, "Initial sync: shared objects", "main"):
-                    files_pushed += 1
-                    demisto.debug("Shared objects pushed successfully")
-                else:
-                    files_failed += 1
-                    errors.append("Failed to push shared objects")
-                    demisto.error("Failed to push shared objects to GitHub")
+                files_to_push.append({'path': file_path, 'content': shared_xml})
             else:
                 files_failed += 1
                 errors.append("Failed to extract shared objects")
                 demisto.error("Failed to extract shared objects from running config")
-            
-            messages.append(f"✅ **Initial Sync Complete:** Pushed {files_pushed} files to GitHub")
+
+            # Push all files in a SINGLE commit
+            if files_to_push:
+                messages.append(f"📤 Uploading {len(files_to_push)} files in a single commit...")
+                if gh_client.push_multiple_files(files_to_push, "Initial sync: Panorama configuration", "main"):
+                    messages.append(f"✅ **Initial Sync Complete:** Pushed {len(files_to_push)} files to GitHub in 1 commit")
+                else:
+                    errors.append("Failed to push files to GitHub")
+                    messages.append("❌ Failed to push files to GitHub")
+            else:
+                messages.append("⚠️ No files to push")
             if files_failed > 0:
                 messages.append(f"⚠️ **Warning:** {files_failed} files failed to push")
                 messages.append("**Failed items:**")
