@@ -188,10 +188,10 @@ class PanOsClient:
         """
         Export configuration using the export API endpoint.
         Returns the raw configuration XML without response wrappers.
-        
+
         Args:
             config_type: 'running' or 'candidate' (default: 'running')
-        
+
         Returns:
             str: Raw XML configuration, or None on failure
         """
@@ -209,20 +209,26 @@ class PanOsClient:
 
             demisto.debug(f"Exporting {config_type} config via export API...")
 
-            # Make request with longer timeout for large configs
+            # CRITICAL: Use stream=True for large configs and increase timeout
             response = requests.get(
                 self.base_url,
                 params=params,
                 verify=self.verify_ssl,
-                timeout=60
+                timeout=120,  # Increased from 60 to 120 seconds
+                stream=True  # Stream response to avoid truncation
             )
-            
+
             if response.status_code == 200:
-                # Response is the raw XML config - no parsing needed!
-                config_xml = response.text
-                
-                demisto.debug(f"Export successful: {len(config_xml)} characters")
-                
+                # Read the streamed response in chunks to avoid truncation
+                config_xml = ''
+                chunk_count = 0
+                for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
+                    if chunk:  # filter out keep-alive chunks
+                        config_xml += chunk
+                        chunk_count += 1
+
+                demisto.debug(f"Export received {chunk_count} chunks, total: {len(config_xml)} characters")
+
                 # Verify it starts with valid XML
                 if config_xml.strip().startswith('<?xml') or config_xml.strip().startswith('<config'):
                     return config_xml
@@ -230,9 +236,13 @@ class PanOsClient:
                     demisto.error(f"Export returned unexpected format: {config_xml[:200]}")
                     return None
             else:
-                demisto.error(f"Export failed with status {response.status_code}: {response.text[:500]}")
+                error_text = response.text[:500] if hasattr(response, 'text') else 'No error text'
+                demisto.error(f"Export failed with status {response.status_code}: {error_text}")
                 return None
-                
+
+        except requests.exceptions.Timeout:
+            demisto.error(f"Export {config_type} config timed out after 120 seconds")
+            return None
         except Exception as e:
             demisto.error(f"Export config exception: {str(e)}")
             return None
@@ -240,12 +250,12 @@ class PanOsClient:
         """
         Export running configuration - tries export API first, falls back to op command.
         Returns the raw configuration XML.
-        
+
         Returns:
             str: Raw XML configuration, or None on failure
         """
         try:
-            # METHOD 1: Try export API first
+            # METHOD 1: Try export API first (BEST for large configs - no XML wrapping!)
             demisto.debug("Attempting to export running config via export API...")
 
             # Use self.base_url which already includes the full URL
@@ -255,70 +265,93 @@ class PanOsClient:
                 'key': self.api_key
             }
 
+            # CRITICAL: Use stream=True for large configs and increase timeout to 120 seconds
+            # Panorama configs can be 10-20MB and take time to generate
             response = requests.get(
                 self.base_url,
                 params=params,
                 verify=self.verify_ssl,
-                timeout=60
+                timeout=120,  # Increased from 60 to 120 seconds
+                stream=True  # Stream response to avoid memory issues
             )
-            
+
             demisto.debug(f"Export API response status: {response.status_code}")
-            demisto.debug(f"Export API response length: {len(response.text)} chars")
-            
+
             if response.status_code == 200:
-                config_xml = response.text
-                
+                # Read the streamed response in chunks to avoid truncation
+                config_xml = ''
+                chunk_count = 0
+                for chunk in response.iter_content(chunk_size=8192, decode_unicode=True):
+                    if chunk:  # filter out keep-alive chunks
+                        config_xml += chunk
+                        chunk_count += 1
+
+                demisto.debug(f"Export API received {chunk_count} chunks, total: {len(config_xml)} characters")
+
                 # Verify it's valid XML
                 if config_xml.strip().startswith('<?xml') or config_xml.strip().startswith('<config'):
-                    # Check if we got a substantial config (should be ~20MB for Panorama)
-                    if len(config_xml) > 1000000:  # More than 1MB
-                        demisto.debug(f"Export API success: {len(config_xml)} characters")
-                        return config_xml
-                    else:
-                        demisto.debug(f"Export API returned small config ({len(config_xml)} chars), trying fallback...")
+                    demisto.debug(f"Export API success: {len(config_xml)} characters")
+                    return config_xml
                 else:
                     demisto.debug(f"Export API returned unexpected format: {config_xml[:200]}")
             else:
-                demisto.debug(f"Export API failed with status {response.status_code}: {response.text[:500]}")
-            
+                error_text = response.text[:500] if hasattr(response, 'text') else 'No error text'
+                demisto.debug(f"Export API failed with status {response.status_code}: {error_text}")
+
+        except requests.exceptions.Timeout:
+            demisto.debug("Export API timed out after 120 seconds")
         except Exception as e:
             demisto.debug(f"Export API exception: {str(e)}")
         
-        # METHOD 2: Fallback to op command (same as get_candidate_config but for running)
+        # METHOD 2: Fallback to op command (less efficient but more compatible)
         try:
             demisto.debug("Falling back to op command for running config...")
-            
-            root = self.execute_api_call({
+
+            # Can't use execute_api_call because it has 30s timeout - too short for large configs
+            # Make direct call with longer timeout
+            params = {
                 'type': 'op',
-                'cmd': '<show><config><running></running></config></show>'
-            })
-            
-            if not root:
-                demisto.error("Op command returned None for running config")
+                'cmd': '<show><config><running></running></config></show>',
+                'key': self.api_key
+            }
+
+            response = requests.get(
+                self.base_url,
+                params=params,
+                verify=self.verify_ssl,
+                timeout=120  # Same 120s timeout as export API
+            )
+
+            if response.status_code != 200:
+                demisto.error(f"Op command failed with status {response.status_code}")
                 return None
-            
+
+            # Parse XML response
+            try:
+                root = ET.fromstring(response.content)
+                if root.get('status') == 'error':
+                    demisto.error(f"PanOS API returned error: {response.text[:500]}")
+                    return None
+            except ET.ParseError as parse_err:
+                demisto.error(f"Failed to parse XML response: {str(parse_err)}")
+                return None
+
             # Extract <config> element from response wrapper
             config_elem = root.find('.//result/config')
-            
+
             if config_elem is not None:
                 config_str = ET.tostring(config_elem, encoding='unicode')
                 demisto.debug(f"Fallback op command success: {len(config_str)} characters")
-                
-                # Verify we got a substantial config
-                if len(config_str) > 1000000:
-                    return config_str
-                else:
-                    demisto.debug(f"Op command returned small config: {len(config_str)} chars")
-                    return config_str  # Return it anyway
+                return config_str
             else:
                 demisto.error("Could not find config element in running config response")
-                
-                # Debug: log response structure
                 full_resp = ET.tostring(root, encoding='unicode')
                 demisto.debug(f"Response structure (first 1000 chars): {full_resp[:1000]}")
-                
                 return None
-                
+
+        except requests.exceptions.Timeout:
+            demisto.error("Fallback op command timed out after 120 seconds")
+            return None
         except Exception as e:
             demisto.error(f"Fallback op command exception: {str(e)}")
             return None
