@@ -73,6 +73,59 @@ def sanitize_path_for_branch(config_path):
     # Add trailing dash for clarity
     return safe_prefix + '-'
 
+def sanitize_comment_for_branch(comment):
+    """
+    Convert admin's config lock comment to a valid GitHub branch name.
+    Follows GitHub branch naming conventions:
+    - Lowercase for consistency
+    - No special characters (only alphanumeric and hyphens)
+    - No consecutive hyphens
+    - No leading/trailing hyphens
+    - Limited to 50 characters for readability
+
+    Examples:
+      'Fix firewall settings' -> 'fix-firewall-settings'
+      'Update Panorama DG-PROD' -> 'update-panorama-dg-prod'
+      'Add new security policies for web servers' -> 'add-new-security-policies-for-web-servers'
+      'Fix  multiple   spaces' -> 'fix-multiple-spaces'
+
+    Args:
+        comment: Config lock comment from admin
+
+    Returns:
+        str: Sanitized branch name, or 'config-update' if comment is empty/invalid
+    """
+    if not comment or not comment.strip():
+        return 'config-update'
+
+    # Convert to lowercase
+    branch_name = comment.lower().strip()
+
+    # Replace spaces and special characters with hyphens
+    # Keep only alphanumeric and hyphens
+    branch_name = re.sub(r'[^a-z0-9-]+', '-', branch_name)
+
+    # Remove consecutive hyphens
+    branch_name = re.sub(r'-+', '-', branch_name)
+
+    # Remove leading/trailing hyphens
+    branch_name = branch_name.strip('-')
+
+    # Limit length to 50 characters
+    if len(branch_name) > 50:
+        # Try to cut at word boundary (last hyphen before char 50)
+        last_hyphen = branch_name[:50].rfind('-')
+        if last_hyphen > 30:  # Only use word boundary if it's not too short
+            branch_name = branch_name[:last_hyphen]
+        else:
+            branch_name = branch_name[:50].rstrip('-')
+
+    # Final validation - if somehow empty, return default
+    if not branch_name:
+        return 'config-update'
+
+    return branch_name
+
 def extract_config_from_response(api_response_root):
     """
     Extract the actual <config> element from PanOS API response.
@@ -1339,8 +1392,9 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                 user = entry.get('name')
                 comment = entry.findtext('comment') or ""
                 if comment:
-                    clean_branch = re.sub(r'[^a-zA-Z0-9]', '-', comment)
+                    clean_branch = sanitize_comment_for_branch(comment)
                     user_branch_map[user] = clean_branch
+                    demisto.debug(f"Config lock mapping: {user} -> '{comment}' -> '{clean_branch}'")
         
         trigger_push = False
         target_branch = ""
@@ -1818,8 +1872,9 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                         user = entry.get('name')
                         comment = entry.findtext('comment') or ""
                         if comment:
-                            clean_branch = re.sub(r'[^a-zA-Z0-9]', '-', comment)
+                            clean_branch = sanitize_comment_for_branch(comment)
                             user_branch_map[user] = clean_branch
+                            demisto.debug(f"Config lock mapping: {user} -> '{comment}' -> '{clean_branch}'")
                 
                 trigger_push = False
                 target_branch = ""
@@ -1847,9 +1902,19 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                             if has_pending:
                                 requesting_admin = admin
                                 admin_name = admin
-                                target_branch = f'{path_prefix}{admin}'
-                                branch_name = target_branch
-                                messages.append(f"✅ PR Trigger detected from admin: `{admin}`")
+
+                                # Check if admin has a config lock with comment (use comment for branch name)
+                                if admin in user_branch_map:
+                                    target_branch = f'{path_prefix}{user_branch_map[admin]}'
+                                    branch_name = target_branch
+                                    messages.append(f"✅ PR Trigger detected from admin: `{admin}`")
+                                    messages.append(f"✅ Matched Config Lock comment. Branch: `{target_branch}`")
+                                else:
+                                    target_branch = f'{path_prefix}{admin}'
+                                    branch_name = target_branch
+                                    messages.append(f"✅ PR Trigger detected from admin: `{admin}`")
+                                    messages.append(f"⚠️ No Config Lock found. Using admin name as branch: `{target_branch}`")
+
                                 trigger_push = True
                                 break
                 
