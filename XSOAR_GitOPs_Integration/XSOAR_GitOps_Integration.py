@@ -143,25 +143,24 @@ class PanOsClient:
             str: Raw XML configuration, or None on failure
         """
         try:
-            # Build export URL
-            url = f"https://{self.hostname}/api/"
+            # Use self.base_url which already includes the full URL
             params = {
                 'type': 'export',
                 'category': 'configuration',
                 'key': self.api_key
             }
-            
+
             # If candidate config requested, add from parameter
             if config_type == 'candidate':
                 params['from'] = 'candidate'
-            
+
             demisto.debug(f"Exporting {config_type} config via export API...")
-            
+
             # Make request with longer timeout for large configs
             response = requests.get(
-                url,
+                self.base_url,
                 params=params,
-                verify=self.verify_cert,
+                verify=self.verify_ssl,
                 timeout=60
             )
             
@@ -195,18 +194,18 @@ class PanOsClient:
         try:
             # METHOD 1: Try export API first
             demisto.debug("Attempting to export running config via export API...")
-            
-            url = f"https://{self.hostname}/api/"
+
+            # Use self.base_url which already includes the full URL
             params = {
                 'type': 'export',
                 'category': 'configuration',
                 'key': self.api_key
             }
-            
+
             response = requests.get(
-                url,
+                self.base_url,
                 params=params,
-                verify=self.verify_cert,
+                verify=self.verify_ssl,
                 timeout=60
             )
             
@@ -1093,8 +1092,9 @@ def manage_snapshot(gh_client: GitHubClient, base_path: str, action: str, config
             
             demisto.debug(f"{'Creating' if action == 'create' else 'Updating'} snapshot at: {snapshot_path} on branch: {branch}")
             demisto.debug(f"Snapshot size: {len(config_str)} characters")
-            
-            message = f"{'Create' if action == 'create' else 'Update'} running config snapshot"
+
+            # IMPORTANT: Add [skip-incident] marker to prevent fetch-incidents loop
+            message = f"{'Create' if action == 'create' else 'Update'} running config snapshot [skip-incident]"
             success = gh_client.push_file(snapshot_path, config_str, message, branch)
             
             if success:
@@ -2014,15 +2014,47 @@ def finalize_deployment_logic(pan_client: PanOsClient, gh_client: GitHubClient, 
     4. (Optional) Commit to Firewall
     """
     messages = []
-    
+
     # Output tracking variables
     status = "no_action"
     unlock_success = False
     admin_unlocked = None
     safety_check_passed = False
     errors = []
-    
+
     messages.append("### Finalizing Deployment")
+
+    # CRITICAL: Check if there's an AUTOMATION lock before proceeding
+    # If no lock exists, this means no PR was created, so finalize shouldn't run
+    messages.append("### Pre-Check: Verifying AUTOMATION Lock Exists")
+    commit_lock_cmd = build_lock_command('commit', device_type)
+    lock_check = pan_client.execute_api_call({'type': 'op', 'cmd': commit_lock_cmd})
+
+    automation_lock_found = False
+    if lock_check:
+        for entry in lock_check.findall('.//entry'):
+            comment = entry.findtext('comment') or ""
+            if "AUTOMATION" in comment:
+                automation_lock_found = True
+                messages.append(f"✅ AUTOMATION lock found - proceeding with finalize")
+                break
+
+    if not automation_lock_found:
+        messages.append("ℹ️ **No AUTOMATION lock found** - No PR workflow to finalize")
+        messages.append("🔍 This commit may be a snapshot update or manual change")
+        messages.append("⏭️  **Skipping finalize workflow**")
+        return CommandResults(
+            readable_output="\n".join(messages),
+            outputs_prefix="FirewallSync.Finalize",
+            outputs={
+                "Status": "no_lock_found",
+                "UnlockSuccess": False,
+                "AdminUnlocked": None,
+                "SafetyCheckPassed": False,
+                "Messages": messages,
+                "Errors": []
+            }
+        )
 
     # ==========================================
     # DEVICE TYPE ROUTING
@@ -2413,21 +2445,29 @@ def fetch_incidents(gh_client, config_path):
 
     if commit_info:
         current_sha = commit_info['sha']
+        commit_message = commit_info.get('message', '')
 
         # 3. Detect Change
+        # Skip commits with [skip-incident] marker (e.g., snapshot updates)
+        should_skip = '[skip-incident]' in commit_message
+
         if last_sha and current_sha != last_sha and current_sha not in processed_shas:
-            demisto.debug(f"New commit detected: {current_sha}")
-            incidents.append({
-                'name': f"Firewall Sync: Merge Detected ({current_sha[:7]})",
-                'occurred': commit_info['date'],
-                'rawJSON': json.dumps(commit_info),
-                'type': 'Firewall Ops',
-                'severity': 2,
-                'CustomFields': {
-                    'commitsha': current_sha,
-                    'author': commit_info['author']
-                }
-            })
+            if should_skip:
+                demisto.debug(f"Skipping commit {current_sha[:7]} - has [skip-incident] marker")
+                demisto.debug(f"Commit message: {commit_message}")
+            else:
+                demisto.debug(f"New commit detected: {current_sha}")
+                incidents.append({
+                    'name': f"Firewall Sync: Merge Detected ({current_sha[:7]})",
+                    'occurred': commit_info['date'],
+                    'rawJSON': json.dumps(commit_info),
+                    'type': 'Firewall Ops',
+                    'severity': 2,
+                    'CustomFields': {
+                        'commitsha': current_sha,
+                        'author': commit_info['author']
+                    }
+                })
 
             processed_shas.append(current_sha)
             # Keep only last 50 SHAs to prevent unbounded growth
