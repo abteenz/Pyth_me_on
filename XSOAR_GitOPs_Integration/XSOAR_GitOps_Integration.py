@@ -1812,97 +1812,59 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
             
             # STEP 2.5: DRIFT DETECTION
             messages.append("### Step 2.5: Drift Detection")
-            
-            # CHANGED: Use export_running_config
+
+            # IMPORTANT: Compare RUNNING config (what's committed and active on device)
+            # vs SNAPSHOT (what was last deployed via GitOps)
+            # Do NOT use change list - that shows candidate vs running (uncommitted changes)
             current_running = pan_client.export_running_config()
-            
+
             if current_running:
                 # Get snapshot from GitHub
                 snapshot_running = manage_snapshot(gh_client, base_path, 'get')
-                
+
                 if snapshot_running:
-                    # Compare current vs snapshot
+                    # Compare current running vs snapshot
                     if current_running.strip() != snapshot_running.strip():
                         drift_detected = True
                         messages.append("⚠️ **DRIFT DETECTED!** Running config differs from last committed state.")
-                        messages.append("🔍 **Analyzing drifted sections...**")
-                        
-                        # Get change list to identify drifted sections
-                        change_list_root = pan_client.execute_api_call({
-                            'type': 'op',
-                            'cmd': '<show><config><list><changes></changes></list></config></show>'
-                        })
-                        
-                        drifted_sections = set()
-                        if change_list_root:
-                            drifted_sections = parse_change_list(change_list_root)
-                        
-                        if not drifted_sections:
-                            # Fallback: Cannot pinpoint sections
-                            messages.append("⚠️ **Cannot identify specific sections** (no pending changes)")
-                            messages.append("📊 **Cause:** Configuration was committed directly to firewall outside GitOps")
-                            messages.append("🔧 **Action Required:** Manual review needed to identify changes")
-                            
-                            drift_branch = f'{path_prefix}drift-detected'
-                            main_sha = gh_client.get_branch_sha("main")
-                            
-                            if main_sha and gh_client.create_branch(drift_branch, main_sha):
-                                full_drift_path = f"{base_path}/_drift/full-running-config.xml" if base_path else "_drift/full-running-config.xml"
+                        messages.append("🔍 **Cause:** Someone committed changes directly to Panorama outside GitOps workflow.")
+                        messages.append("📊 **Action:** Capturing current running config for review...")
 
-                                # Pretty-print for human-readable diffs
-                                formatted_drift = pretty_print_xml(current_running)
+                        # Create drift branch and push FULL running config for manual review
+                        # We push the full config (not individual sections) because:
+                        # 1. Change list shows candidate vs running (not drift)
+                        # 2. Running config is the committed state we need to reconcile
+                        # 3. GitHub diff will clearly show what changed
 
-                                if gh_client.push_file(full_drift_path, formatted_drift, "Drift detected: full config for manual review", drift_branch):
-                                    messages.append(f"✅ Full running config saved to `{drift_branch}` for manual review")
-                                    messages.append(f"📁 Path: `{full_drift_path}`")
-                                    status = "drift_detected"
-                                    branch_name = drift_branch
-                        else:
-                            # We identified specific drifted sections
-                            messages.append(f"📝 **Drifted sections identified:** {len(drifted_sections)}")
-                            for sec_type, sec_name in drifted_sections:
-                                messages.append(f"   - {sec_type}: {sec_name or '(shared)'}")
-                            
-                            drift_branch = f'{path_prefix}drift-detected'
-                            main_sha = gh_client.get_branch_sha("main")
-                            
-                            if main_sha and gh_client.create_branch(drift_branch, main_sha):
-                                drift_files_pushed = 0
-                                
-                                for sec_type, sec_name in drifted_sections:
-                                    section_xml = extract_section_from_config(current_running, sec_type, sec_name)
+                        drift_branch = f'{path_prefix}drift-detected'
+                        main_sha = gh_client.get_branch_sha("main")
 
-                                    if section_xml:
-                                        # Pretty-print for human-readable diffs
-                                        formatted_section = pretty_print_xml(section_xml)
+                        if main_sha and gh_client.create_branch(drift_branch, main_sha):
+                            # Push full running config to _drift folder for manual review
+                            full_drift_path = f"{base_path}/_drift/full-running-config.xml" if base_path else "_drift/full-running-config.xml"
 
-                                        if sec_type == 'device-group':
-                                            folder = 'device-groups'
-                                        elif sec_type == 'template':
-                                            folder = 'templates'
-                                        elif sec_type == 'template-stack':
-                                            folder = 'template-stacks'
-                                        elif sec_type == 'shared':
-                                            folder = 'shared'
-                                            sec_name = 'shared'
-                                        else:
-                                            continue
+                            # Pretty-print for human-readable diffs
+                            formatted_drift = pretty_print_xml(current_running)
 
-                                        file_path = f"{base_path}/{folder}/{sec_name}.xml" if base_path else f"{folder}/{sec_name}.xml"
-                                        commit_msg = f"Drift detected: {sec_type} {sec_name or 'shared'}"
+                            if gh_client.push_file(full_drift_path, formatted_drift, "Drift detected: committed changes outside GitOps", drift_branch):
+                                messages.append(f"✅ Full running config saved to `{drift_branch}` for manual review")
+                                messages.append(f"📁 Path: `{full_drift_path}`")
 
-                                        if gh_client.push_file(file_path, formatted_section, commit_msg, drift_branch):
-                                            drift_files_pushed += 1
-                                
-                                # Also update the snapshot in drift branch to current running
-                                manage_snapshot(gh_client, base_path, 'update', current_running, drift_branch)
-                                
-                                messages.append(f"✅ Created drift branch `{drift_branch}` with {drift_files_pushed} updated sections")
-                                messages.append("ℹ️ **Action Required:** Review and merge drift branch to reconcile state")
+                                # Also update snapshot in drift branch to current running
+                                if manage_snapshot(gh_client, base_path, 'update', current_running, drift_branch):
+                                    messages.append("✅ Snapshot updated in drift branch")
+
                                 status = "drift_detected"
                                 branch_name = drift_branch
-                        
-                        messages.append("➡️ **Proceeding:** Continuing workflow despite drift detection...")
+                                messages.append("ℹ️ **Action Required:** Review drift branch, identify changes, and merge to reconcile state")
+                            else:
+                                messages.append("⚠️ Failed to save drift config to GitHub")
+                                errors.append("Failed to push drift config")
+                        else:
+                            messages.append("⚠️ Failed to create drift branch")
+                            errors.append("Failed to create drift branch")
+
+                        messages.append("➡️ **Proceeding:** Continuing workflow to process candidate changes...")
                     else:
                         messages.append("✅ No drift detected. Running config matches snapshot.")
                 else:
