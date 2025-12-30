@@ -2326,25 +2326,12 @@ def finalize_deployment_logic(pan_client: PanOsClient, gh_client: GitHubClient, 
             status = "already_unlocked"
             messages.append("✅ No automation lock found (already removed).")
 
-        # 4. UPDATE SNAPSHOT
-        if safety_check_passed and unlock_success:
-            messages.append("### Step 4: Updating Snapshot")
-            messages.append("📸 Updating running config snapshot...")
+        # NOTE: Snapshot is NOT updated in finalize
+        # The feature branch already included the updated snapshot (candidate config)
+        # When PR is merged, main gets the updated snapshot automatically
+        # After admin manually commits, running config will match the snapshot
 
-            # Get current running config from firewall
-            running_config_str = pan_client.export_running_config()
-
-            if running_config_str:
-                if manage_snapshot(gh_client, base_path, 'update', running_config_str, "main"):
-                    messages.append("✅ Snapshot updated for drift detection")
-                else:
-                    messages.append("⚠️ Warning: Failed to update snapshot")
-                    errors.append("Failed to update snapshot")
-            else:
-                messages.append("⚠️ Warning: Could not export running config for snapshot update")
-                errors.append("Could not export running config")
-
-        # 5. COMMIT (OPTIONAL - COMMENTED OUT)
+        # COMMIT (OPTIONAL - COMMENTED OUT)
         """
         messages.append("💾 Committing to Firewall...")
         commit_cmd = {'type': 'commit', 'cmd': '<commit></commit>'}
@@ -2541,25 +2528,12 @@ def finalize_deployment_logic(pan_client: PanOsClient, gh_client: GitHubClient, 
             status = "already_unlocked"
             messages.append("✅ No automation lock found (already removed).")
         
-        # 5. UPDATE SNAPSHOT
-        if safety_check_passed and unlock_success:
-            messages.append("### Step 5: Updating Snapshot")
-            messages.append("📸 Updating running config snapshot...")
-            
-            # CHANGED: Use export_running_config
-            running_config_str = pan_client.export_running_config()
-            
-            if running_config_str:
-                if manage_snapshot(gh_client, base_path, 'update', running_config_str, "main"):
-                    messages.append("✅ Snapshot updated for drift detection")
-                else:
-                    messages.append("⚠️ Warning: Failed to update snapshot")
-                    errors.append("Failed to update snapshot")
-            else:
-                messages.append("⚠️ Warning: Could not export running config for snapshot update")
-                errors.append("Could not export running config")
-        
-        # 6. COMMIT (OPTIONAL - COMMENTED OUT)
+        # NOTE: Snapshot is NOT updated in finalize
+        # The feature branch already included the updated snapshot (candidate config)
+        # When PR is merged, main gets the updated snapshot automatically
+        # After admin manually commits, running config will match the snapshot
+
+        # COMMIT (OPTIONAL - COMMENTED OUT)
         """
         messages.append("💾 Committing to Panorama...")
         commit_cmd = {'type': 'commit', 'cmd': '<commit></commit>'}
