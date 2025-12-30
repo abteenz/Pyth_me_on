@@ -2252,7 +2252,11 @@ def finalize_deployment_logic(pan_client: PanOsClient, gh_client: GitHubClient, 
             )
 
         # 2. DIFF CHECK (Simple String Comparison)
-        if gh_content.strip() == fw_candidate.strip():
+        # CRITICAL: Pretty-print candidate config to match GitHub format before comparing
+        # GitHub stores config as pretty-printed, but get_candidate_config returns compact XML
+        fw_candidate_formatted = pretty_print_xml(fw_candidate)
+
+        if gh_content.strip() == fw_candidate_formatted.strip():
             safety_check_passed = True
             messages.append("✅ **Safety Check Passed:** Firewall Candidate matches GitHub Main.")
         else:
@@ -2445,12 +2449,16 @@ def finalize_deployment_logic(pan_client: PanOsClient, gh_client: GitHubClient, 
                 continue
             
             file_path = f"{base_path}/{folder}/{sec_name}.xml" if base_path else f"{folder}/{sec_name}.xml"
-            
+
             gh_section = gh_client.get_file_content(file_path, "main")
             fw_section = extract_section_from_config(full_candidate_str, sec_type, sec_name if sec_type != 'shared' else None)
-            
+
             if gh_section and fw_section:
-                if gh_section.strip() == fw_section.strip():
+                # CRITICAL: Pretty-print extracted section to match GitHub format before comparing
+                # GitHub stores sections as pretty-printed, but extract_section_from_config returns compact XML
+                fw_section_formatted = pretty_print_xml(fw_section)
+
+                if gh_section.strip() == fw_section_formatted.strip():
                     sections_verified += 1
                     messages.append(f"   ✅ {folder}/{sec_name}.xml - Match")
                 else:
