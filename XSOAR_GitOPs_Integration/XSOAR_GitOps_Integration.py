@@ -126,6 +126,38 @@ def sanitize_comment_for_branch(comment):
 
     return branch_name
 
+def pretty_print_xml(xml_string):
+    """
+    Format XML string with proper indentation for human readability.
+    Essential for GitOps workflows where humans review PRs and diffs.
+
+    Args:
+        xml_string: Compact or unformatted XML string
+
+    Returns:
+        str: Pretty-formatted XML with indentation
+    """
+    try:
+        # Parse the XML string
+        root = ET.fromstring(xml_string)
+
+        # Try ET.indent() if available (Python 3.9+)
+        try:
+            ET.indent(root, space="  ", level=0)
+            formatted = ET.tostring(root, encoding='unicode')
+        except AttributeError:
+            # Fallback for Python < 3.9: just return with line breaks
+            # ET.tostring doesn't format, so we'll parse and reserialize
+            formatted = ET.tostring(root, encoding='unicode')
+
+        demisto.debug(f"Pretty-printed XML: {len(xml_string)} chars -> {len(formatted)} chars")
+        return formatted
+
+    except Exception as e:
+        demisto.error(f"Failed to pretty-print XML: {str(e)}")
+        # Return original if formatting fails
+        return xml_string
+
 def extract_config_from_response(api_response_root):
     """
     Extract the actual <config> element from PanOS API response.
@@ -1177,11 +1209,14 @@ def manage_snapshot(gh_client: GitHubClient, base_path: str, action: str, config
                 return False
             
             demisto.debug(f"{'Creating' if action == 'create' else 'Updating'} snapshot at: {snapshot_path} on branch: {branch}")
-            demisto.debug(f"Snapshot size: {len(config_str)} characters")
+            demisto.debug(f"Snapshot size (before formatting): {len(config_str)} characters")
+
+            # CRITICAL: Pretty-print XML for human-readable diffs in GitHub PRs
+            formatted_config = pretty_print_xml(config_str)
 
             # IMPORTANT: Add [skip-incident] marker to prevent fetch-incidents loop
             message = f"{'Create' if action == 'create' else 'Update'} running config snapshot [skip-incident]"
-            success = gh_client.push_file(snapshot_path, config_str, message, branch)
+            success = gh_client.push_file(snapshot_path, formatted_config, message, branch)
             
             if success:
                 demisto.debug(f"Snapshot {action} successful")
@@ -1280,9 +1315,12 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
 
             messages.append(f"✅ Retrieved running config ({len(running_config_str)} characters)")
 
+            # Pretty-print for human-readable GitHub diffs
+            formatted_running_config = pretty_print_xml(running_config_str)
+
             # Push running config to main branch
             messages.append("📤 Uploading running config to GitHub main branch...")
-            if gh_client.push_file(config_path, running_config_str, "Initial sync: running config", "main"):
+            if gh_client.push_file(config_path, formatted_running_config, "Initial sync: running config", "main"):
                 messages.append(f"✅ Config file uploaded to `{config_path}`")
 
                 # Create snapshot for drift detection
@@ -1366,8 +1404,11 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                     if main_sha and gh_client.create_branch(drift_branch, main_sha):
                         # Push full running config to _drift folder for manual review
                         full_drift_path = f"{base_path}/_drift/full-running-config.xml" if base_path else "_drift/full-running-config.xml"
-                        
-                        if gh_client.push_file(full_drift_path, current_running, "Drift detected: committed changes outside GitOps", drift_branch):
+
+                        # Pretty-print for human-readable diffs
+                        formatted_drift_config = pretty_print_xml(current_running)
+
+                        if gh_client.push_file(full_drift_path, formatted_drift_config, "Drift detected: committed changes outside GitOps", drift_branch):
                             messages.append(f"✅ Full running config saved to `{drift_branch}` for manual review")
                             messages.append(f"📁 Path: `{full_drift_path}`")
                             
@@ -1504,12 +1545,15 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
             
             # CHANGED: Use get_candidate_config
             candidate_str = pan_client.get_candidate_config()
-            
+
             if candidate_str:
+                # Pretty-print for human-readable diffs
+                formatted_candidate = pretty_print_xml(candidate_str)
+
                 main_sha = gh_client.get_branch_sha("main")
-                
+
                 if main_sha and gh_client.create_branch(target_branch, main_sha):
-                    success = gh_client.push_file(config_path, candidate_str, commit_message, target_branch)
+                    success = gh_client.push_file(config_path, formatted_candidate, commit_message, target_branch)
                     if success:
                         status = "pr_created"
                         messages.append(f"✅ **Success:** Pushed candidate config to `{target_branch}`")
@@ -1682,8 +1726,10 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
             for dg_name in all_sections['device-groups']:
                 dg_xml = extract_section_from_config(full_config_str, 'device-group', dg_name)
                 if dg_xml:
+                    # Pretty-print for human-readable diffs
+                    formatted_dg = pretty_print_xml(dg_xml)
                     file_path = f"{base_path}/device-groups/{dg_name}.xml" if base_path else f"device-groups/{dg_name}.xml"
-                    files_to_push.append({'path': file_path, 'content': dg_xml})
+                    files_to_push.append({'path': file_path, 'content': formatted_dg})
                 else:
                     files_failed += 1
                     errors.append(f"Failed to extract device-group: {dg_name}")
@@ -1694,8 +1740,10 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
             for tmpl_name in all_sections['templates']:
                 tmpl_xml = extract_section_from_config(full_config_str, 'template', tmpl_name)
                 if tmpl_xml:
+                    # Pretty-print for human-readable diffs
+                    formatted_tmpl = pretty_print_xml(tmpl_xml)
                     file_path = f"{base_path}/templates/{tmpl_name}.xml" if base_path else f"templates/{tmpl_name}.xml"
-                    files_to_push.append({'path': file_path, 'content': tmpl_xml})
+                    files_to_push.append({'path': file_path, 'content': formatted_tmpl})
                 else:
                     files_failed += 1
                     errors.append(f"Failed to extract template: {tmpl_name}")
@@ -1706,8 +1754,10 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
             for ts_name in all_sections['template-stacks']:
                 ts_xml = extract_section_from_config(full_config_str, 'template-stack', ts_name)
                 if ts_xml:
+                    # Pretty-print for human-readable diffs
+                    formatted_ts = pretty_print_xml(ts_xml)
                     file_path = f"{base_path}/template-stacks/{ts_name}.xml" if base_path else f"template-stacks/{ts_name}.xml"
-                    files_to_push.append({'path': file_path, 'content': ts_xml})
+                    files_to_push.append({'path': file_path, 'content': formatted_ts})
                 else:
                     files_failed += 1
                     errors.append(f"Failed to extract template-stack: {ts_name}")
@@ -1717,9 +1767,11 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
             demisto.debug("Extracting shared objects...")
             shared_xml = extract_section_from_config(full_config_str, 'shared', None)
             if shared_xml:
-                demisto.debug(f"Shared objects extracted: {len(shared_xml)} characters")
+                # Pretty-print for human-readable diffs
+                formatted_shared = pretty_print_xml(shared_xml)
+                demisto.debug(f"Shared objects extracted: {len(formatted_shared)} characters")
                 file_path = f"{base_path}/shared/shared.xml" if base_path else "shared/shared.xml"
-                files_to_push.append({'path': file_path, 'content': shared_xml})
+                files_to_push.append({'path': file_path, 'content': formatted_shared})
             else:
                 files_failed += 1
                 errors.append("Failed to extract shared objects")
@@ -1796,7 +1848,11 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                             
                             if main_sha and gh_client.create_branch(drift_branch, main_sha):
                                 full_drift_path = f"{base_path}/_drift/full-running-config.xml" if base_path else "_drift/full-running-config.xml"
-                                if gh_client.push_file(full_drift_path, current_running, "Drift detected: full config for manual review", drift_branch):
+
+                                # Pretty-print for human-readable diffs
+                                formatted_drift = pretty_print_xml(current_running)
+
+                                if gh_client.push_file(full_drift_path, formatted_drift, "Drift detected: full config for manual review", drift_branch):
                                     messages.append(f"✅ Full running config saved to `{drift_branch}` for manual review")
                                     messages.append(f"📁 Path: `{full_drift_path}`")
                                     status = "drift_detected"
@@ -1815,8 +1871,11 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                                 
                                 for sec_type, sec_name in drifted_sections:
                                     section_xml = extract_section_from_config(current_running, sec_type, sec_name)
-                                    
+
                                     if section_xml:
+                                        # Pretty-print for human-readable diffs
+                                        formatted_section = pretty_print_xml(section_xml)
+
                                         if sec_type == 'device-group':
                                             folder = 'device-groups'
                                         elif sec_type == 'template':
@@ -1828,11 +1887,11 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                                             sec_name = 'shared'
                                         else:
                                             continue
-                                        
+
                                         file_path = f"{base_path}/{folder}/{sec_name}.xml" if base_path else f"{folder}/{sec_name}.xml"
                                         commit_msg = f"Drift detected: {sec_type} {sec_name or 'shared'}"
-                                        
-                                        if gh_client.push_file(file_path, section_xml, commit_msg, drift_branch):
+
+                                        if gh_client.push_file(file_path, formatted_section, commit_msg, drift_branch):
                                             drift_files_pushed += 1
                                 
                                 # Also update the snapshot in drift branch to current running
@@ -2048,11 +2107,14 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                             
                             file_path = f"{base_path}/{folder}/{sec_name}.xml" if base_path else f"{folder}/{sec_name}.xml"
                             commit_msg = f"Updated {sec_type}: {sec_name or 'shared'} by {admin_name}"
-                            
+
+                            # Pretty-print for human-readable diffs
+                            formatted_section = pretty_print_xml(section_xml)
+
                             # Log what we're about to push
-                            demisto.debug(f"Pushing {file_path} ({len(section_xml)} chars) to branch {target_branch}")
-                            
-                            if gh_client.push_file(file_path, section_xml, commit_msg, target_branch):
+                            demisto.debug(f"Pushing {file_path} ({len(formatted_section)} chars) to branch {target_branch}")
+
+                            if gh_client.push_file(file_path, formatted_section, commit_msg, target_branch):
                                 files_pushed += 1
                                 messages.append(f"   ✅ Pushed: {folder}/{sec_name}.xml")
                             else:
