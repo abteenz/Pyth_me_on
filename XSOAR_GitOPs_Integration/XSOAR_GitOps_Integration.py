@@ -1209,14 +1209,16 @@ def manage_snapshot(gh_client: GitHubClient, base_path: str, action: str, config
                 return False
             
             demisto.debug(f"{'Creating' if action == 'create' else 'Updating'} snapshot at: {snapshot_path} on branch: {branch}")
-            demisto.debug(f"Snapshot size (before formatting): {len(config_str)} characters")
+            demisto.debug(f"Snapshot size: {len(config_str)} characters")
 
-            # CRITICAL: Pretty-print XML for human-readable diffs in GitHub PRs
-            formatted_config = pretty_print_xml(config_str)
+            # CRITICAL: Save snapshot in RAW/COMPACT format for reliable drift detection
+            # Do NOT pretty-print - drift comparison requires exact format matching with export_running_config()
+            # Section files are still pretty-printed for human readability in PRs
+            # Snapshot is for automation use only, not for human review
 
             # IMPORTANT: Add [skip-incident] marker to prevent fetch-incidents loop
             message = f"{'Create' if action == 'create' else 'Update'} running config snapshot [skip-incident]"
-            success = gh_client.push_file(snapshot_path, formatted_config, message, branch)
+            success = gh_client.push_file(snapshot_path, config_str, message, branch)
             
             if success:
                 demisto.debug(f"Snapshot {action} successful")
