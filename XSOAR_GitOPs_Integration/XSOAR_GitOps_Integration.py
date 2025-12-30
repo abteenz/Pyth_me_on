@@ -1508,7 +1508,16 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                     if success:
                         status = "pr_created"
                         messages.append(f"✅ **Success:** Pushed candidate config to `{target_branch}`")
-                        
+
+                        # CRITICAL: Update snapshot in feature branch with candidate config
+                        # This ensures when PR is merged, main branch gets updated snapshot
+                        # Prevents false drift detection after commit
+                        messages.append("📸 Updating snapshot in feature branch...")
+                        if manage_snapshot(gh_client, base_path, 'update', candidate_str, target_branch):
+                            messages.append("✅ Snapshot updated in feature branch")
+                        else:
+                            messages.append("⚠️ Warning: Failed to update snapshot in feature branch")
+
                         messages.append("🔒 Adding System Lock (Wait & Validate mode)...")
                         if pan_client.add_system_lock():
                             messages.append("✅ System Lock Added.")
@@ -2100,6 +2109,15 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                     if files_pushed > 0:
                         status = "pr_created"
                         messages.append(f"✅ **Success:** Pushed {files_pushed} files to branch `{target_branch}`")
+
+                        # CRITICAL: Update snapshot in feature branch with candidate config
+                        # This ensures when PR is merged, main branch gets updated snapshot
+                        # Prevents false drift detection after commit
+                        messages.append("📸 Updating snapshot in feature branch...")
+                        if manage_snapshot(gh_client, base_path, 'update', full_config_str, target_branch):
+                            messages.append("✅ Snapshot updated in feature branch")
+                        else:
+                            messages.append("⚠️ Warning: Failed to update snapshot in feature branch")
 
                         # Add system lock
                         messages.append("🔒 Adding System Lock...")
