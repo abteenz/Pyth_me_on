@@ -504,85 +504,103 @@ class GitHubClient:
         # Use base_url which already includes /contents/
         url = self.base_url + file_path
         try:
-            res = requests.get(url, headers=self.headers, params={"ref": branch})
+            res = requests.get(url, headers=self.headers, params={"ref": branch}, timeout=30)
             if res.status_code == 200:
                 data = res.json()
-                
+
                 # Case 1: Small file, content is in response
                 if 'content' in data and data['content']:
                     return base64.b64decode(data['content']).decode('utf-8')
-                
+
                 # Case 2: Large file, content is missing, use SHA to get Blob
                 if 'sha' in data:
                     return self.get_blob_content(data['sha'])
-                    
+
             return None
         except Exception as e:
-            demisto.debug(f"Error fetching file content: {str(e)}")
+            demisto.error(f"Error fetching file content: {str(e)}")
             return None
 
     def get_blob_content(self, file_sha):
         """Fetch raw blob content for large files"""
-        # Use repo_root_url for git/blobs
-        url = f"{self.repo_root_url}/git/blobs/{file_sha}"
-        res = requests.get(url, headers=self.headers)
-        if res.status_code == 200:
-            data = res.json()
-            content = base64.b64decode(data['content']).decode('utf-8')
-            return content
-        return None
+        try:
+            # Use repo_root_url for git/blobs
+            url = f"{self.repo_root_url}/git/blobs/{file_sha}"
+            res = requests.get(url, headers=self.headers, timeout=30)
+            if res.status_code == 200:
+                data = res.json()
+                content = base64.b64decode(data['content']).decode('utf-8')
+                return content
+            return None
+        except Exception as e:
+            demisto.error(f"Error fetching blob content: {str(e)}")
+            return None
 
     def get_branch_sha(self, branch_name):
-        # Use repo_root_url for git/ref
-        url = f"{self.repo_root_url}/git/ref/heads/{branch_name}"
-        res = requests.get(url, headers=self.headers)
-        if res.status_code == 200:
-            return res.json()['object']['sha']
-        return None
+        """Get SHA of a branch"""
+        try:
+            # Use repo_root_url for git/ref
+            url = f"{self.repo_root_url}/git/ref/heads/{branch_name}"
+            res = requests.get(url, headers=self.headers, timeout=30)
+            if res.status_code == 200:
+                return res.json()['object']['sha']
+            return None
+        except Exception as e:
+            demisto.error(f"Error getting branch SHA for '{branch_name}': {str(e)}")
+            return None
 
     def get_latest_commit_details(self, branch="main"):
         """Fetches the latest commit SHA and timestamp for a branch (Used for Polling)."""
-        url = f"{self.repo_root_url}/commits/{branch}"
-        res = requests.get(url, headers=self.headers)
-        if res.status_code == 200:
-            data = res.json()
-            return {
-                'sha': data['sha'],
-                'date': data['commit']['committer']['date'], # ISO 8601 string
-                'message': data['commit']['message'],
-                'author': data['commit']['author']['name']
-            }
-        return None
+        try:
+            url = f"{self.repo_root_url}/commits/{branch}"
+            res = requests.get(url, headers=self.headers, timeout=30)
+            if res.status_code == 200:
+                data = res.json()
+                return {
+                    'sha': data['sha'],
+                    'date': data['commit']['committer']['date'], # ISO 8601 string
+                    'message': data['commit']['message'],
+                    'author': data['commit']['author']['name']
+                }
+            return None
+        except Exception as e:
+            demisto.error(f"Error getting latest commit details for '{branch}': {str(e)}")
+            return None
 
     def create_branch(self, new_branch_name, source_sha):
-        url = f"{self.repo_root_url}/git/refs"
-        data = {"ref": f"refs/heads/{new_branch_name}", "sha": source_sha}
-        res = requests.post(url, headers=self.headers, json=data)
+        """Create or update a branch"""
+        try:
+            url = f"{self.repo_root_url}/git/refs"
+            data = {"ref": f"refs/heads/{new_branch_name}", "sha": source_sha}
+            res = requests.post(url, headers=self.headers, json=data, timeout=30)
 
-        if res.status_code == 201:
-            return True
-        elif res.status_code == 422:
-            resp_json = res.json()
-            message = resp_json.get('message', '')
-            if 'Reference already exists' in message:
-                # Branch exists - UPDATE it instead
-                demisto.debug(f"Branch '{new_branch_name}' exists. Updating to SHA: {source_sha}")
-                update_url = f"{self.repo_root_url}/git/refs/heads/{new_branch_name}"
-                update_data = {"sha": source_sha, "force": True}  # force=True allows non-fast-forward updates
-                update_res = requests.patch(update_url, headers=self.headers, json=update_data)
+            if res.status_code == 201:
+                return True
+            elif res.status_code == 422:
+                resp_json = res.json()
+                message = resp_json.get('message', '')
+                if 'Reference already exists' in message:
+                    # Branch exists - UPDATE it instead
+                    demisto.debug(f"Branch '{new_branch_name}' exists. Updating to SHA: {source_sha}")
+                    update_url = f"{self.repo_root_url}/git/refs/heads/{new_branch_name}"
+                    update_data = {"sha": source_sha, "force": True}  # force=True allows non-fast-forward updates
+                    update_res = requests.patch(update_url, headers=self.headers, json=update_data, timeout=30)
 
-                if update_res.status_code == 200:
-                    demisto.debug(f"Successfully updated branch '{new_branch_name}' to latest main")
-                    return True
+                    if update_res.status_code == 200:
+                        demisto.debug(f"Successfully updated branch '{new_branch_name}' to latest main")
+                        return True
+                    else:
+                        demisto.error(f"Failed to update branch: {update_res.status_code} - {update_res.text}")
+                        return False
                 else:
-                    demisto.error(f"Failed to update branch: {update_res.status_code} - {update_res.text}")
+                    demisto.debug(f"GitHub Branch Error: 422 - {message}")
                     return False
-            else:
-                demisto.debug(f"GitHub Branch Error: 422 - {message}")
-                return False
 
-        demisto.debug(f"GitHub Branch Creation Failed: {res.status_code} - {res.text}")
-        return False
+            demisto.debug(f"GitHub Branch Creation Failed: {res.status_code} - {res.text}")
+            return False
+        except Exception as e:
+            demisto.error(f"Error creating/updating branch '{new_branch_name}': {str(e)}")
+            return False
 
     def push_file(self, file_path, content, message, branch):
         """
@@ -598,7 +616,7 @@ class GitHubClient:
 
             # 2. Get the tree SHA of the latest commit
             commit_url = f"{self.repo_root_url}/git/commits/{branch_sha}"
-            res = requests.get(commit_url, headers=self.headers)
+            res = requests.get(commit_url, headers=self.headers, timeout=30)
             res.raise_for_status()
             tree_sha = res.json()['tree']['sha']
 
@@ -612,7 +630,7 @@ class GitHubClient:
                 "content": content_b64,
                 "encoding": "base64"
             }
-            res = requests.post(blob_url, headers=self.headers, json=blob_data)
+            res = requests.post(blob_url, headers=self.headers, json=blob_data, timeout=60)
             res.raise_for_status()
             new_blob_sha = res.json()['sha']
 
@@ -629,7 +647,7 @@ class GitHubClient:
                     }
                 ]
             }
-            res = requests.post(tree_url, headers=self.headers, json=tree_data)
+            res = requests.post(tree_url, headers=self.headers, json=tree_data, timeout=30)
             res.raise_for_status()
             new_tree_sha = res.json()['sha']
 
@@ -640,7 +658,7 @@ class GitHubClient:
                 "tree": new_tree_sha,
                 "parents": [branch_sha]
             }
-            res = requests.post(new_commit_url, headers=self.headers, json=commit_data)
+            res = requests.post(new_commit_url, headers=self.headers, json=commit_data, timeout=30)
             res.raise_for_status()
             new_commit_sha = res.json()['sha']
 
@@ -650,7 +668,7 @@ class GitHubClient:
                 "sha": new_commit_sha,
                 "force": False # Standard push
             }
-            res = requests.patch(ref_url, headers=self.headers, json=ref_data)
+            res = requests.patch(ref_url, headers=self.headers, json=ref_data, timeout=30)
             
             if res.status_code != 200:
                 demisto.error(f"❌ Failed to update branch ref: {res.status_code} {res.text}")
@@ -708,7 +726,7 @@ class GitHubClient:
 
                 # 2. Get the tree SHA of the latest commit
                 commit_url = f"{self.repo_root_url}/git/commits/{branch_sha}"
-                res = requests.get(commit_url, headers=self.headers)
+                res = requests.get(commit_url, headers=self.headers, timeout=30)
                 res.raise_for_status()
                 tree_sha = res.json()['tree']['sha']
 
@@ -729,7 +747,7 @@ class GitHubClient:
                         "content": content_b64,
                         "encoding": "base64"
                     }
-                    res = requests.post(blob_url, headers=self.headers, json=blob_data)
+                    res = requests.post(blob_url, headers=self.headers, json=blob_data, timeout=60)
                     res.raise_for_status()
                     blob_sha = res.json()['sha']
 
@@ -748,7 +766,7 @@ class GitHubClient:
                     "base_tree": tree_sha,
                     "tree": tree_items
                 }
-                res = requests.post(tree_url, headers=self.headers, json=tree_data)
+                res = requests.post(tree_url, headers=self.headers, json=tree_data, timeout=30)
                 res.raise_for_status()
                 new_tree_sha = res.json()['sha']
 
@@ -760,7 +778,7 @@ class GitHubClient:
                     "tree": new_tree_sha,
                     "parents": [branch_sha]
                 }
-                res = requests.post(new_commit_url, headers=self.headers, json=commit_data)
+                res = requests.post(new_commit_url, headers=self.headers, json=commit_data, timeout=30)
                 res.raise_for_status()
                 new_commit_sha = res.json()['sha']
 
@@ -771,7 +789,7 @@ class GitHubClient:
                     "sha": new_commit_sha,
                     "force": False
                 }
-                res = requests.patch(ref_url, headers=self.headers, json=ref_data)
+                res = requests.patch(ref_url, headers=self.headers, json=ref_data, timeout=30)
 
                 if res.status_code != 200:
                     demisto.error(f"❌ Failed to update branch ref: {res.status_code} {res.text}")
@@ -1060,8 +1078,8 @@ def check_github_structure_exists(gh_client: GitHubClient, base_path):
         
         # Try to get the folder - if it exists, we get content, if not, we get 404
         url = gh_client.base_url + dg_folder_path
-        res = requests.get(url, headers=gh_client.headers, params={"ref": "main"})
-        
+        res = requests.get(url, headers=gh_client.headers, params={"ref": "main"}, timeout=30)
+
         if res.status_code == 200:
             demisto.debug(f"GitHub structure exists at {base_path}")
             return True
@@ -1099,8 +1117,8 @@ def detect_new_sections(current_sections, gh_client: GitHubClient, base_path):
             
             # Get list of files in GitHub folder
             url = gh_client.base_url + folder_path
-            res = requests.get(url, headers=gh_client.headers, params={"ref": "main"})
-            
+            res = requests.get(url, headers=gh_client.headers, params={"ref": "main"}, timeout=30)
+
             github_sections = set()
             if res.status_code == 200:
                 items = res.json()
@@ -1449,7 +1467,9 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
                         requesting_admin = admin
                         admin_name = admin
                         if admin in user_branch_map:
-                            target_branch = f'{path_prefix}{user_branch_map[admin]}'
+                            # Sanitize admin name for branch naming
+                            safe_admin = (admin or '').lower().replace(' ', '-').replace('@', '-')
+                            target_branch = f'{path_prefix}{user_branch_map[admin]}-by-{safe_admin}'
                             branch_name = target_branch
                             commit_message = f"Config modified by {admin} for {target_branch}"
                             messages.append(f"✅ Matched Trigger with Config Lock. Branch: `{target_branch}`")
@@ -1975,7 +1995,9 @@ def sync_firewall_logic(pan_client: PanOsClient, gh_client: GitHubClient, config
 
                                 # Check if admin has a config lock with comment (use comment for branch name)
                                 if admin in user_branch_map:
-                                    target_branch = f'{path_prefix}{user_branch_map[admin]}'
+                                    # Sanitize admin name for branch naming
+                                    safe_admin = (admin or '').lower().replace(' ', '-').replace('@', '-')
+                                    target_branch = f'{path_prefix}{user_branch_map[admin]}-by-{safe_admin}'
                                     branch_name = target_branch
                                     messages.append(f"✅ PR Trigger detected from admin: `{admin}`")
                                     messages.append(f"✅ Matched Config Lock comment. Branch: `{target_branch}`")
@@ -2661,7 +2683,7 @@ def test_github_connectivity(gh_client: GitHubClient, base_path: str) -> Command
         else:
             # README might not exist, try root listing
             url = gh_client.base_url
-            res = requests.get(url, headers=gh_client.headers, params={"ref": "main"})
+            res = requests.get(url, headers=gh_client.headers, params={"ref": "main"}, timeout=30)
             if res.status_code == 200:
                 messages.append(f"   ✅ PASS - Can read repository root")
                 tests_passed += 1
